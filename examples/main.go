@@ -94,9 +94,13 @@ func startClient(targetURL string) {
 		}
 	}
 
-	// 3. 此时所有请求都已“预埋” (Header Straddling 状态)
-	fmt.Println("[Client] ⏸️  All requests buffered. Waiting 1s before FIRE...")
-	time.Sleep(1 * time.Second)
+	// 3. 等待所有请求进入被扣留状态（或超时）
+	fmt.Println("[Client] ⏸️  Waiting for all requests to be buffered...")
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := st.Wait(ctx, requests); err != nil {
+		fmt.Printf("[Client] Wait error: %v\n", err)
+	}
 
 	// 4. 瞬时触发！
 	fmt.Println("[Client] 🔥 FIRE! Releasing last bytes concurrently!", time.Now().Format("15:04:05.000000"))

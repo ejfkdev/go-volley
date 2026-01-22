@@ -22,6 +22,21 @@ go get -u github.com/ejfkdev/go-volley
 
 # ⚡️ 快速开始 (Quick Start)
 
+```go
+    vt := volley.NewTransport()
+    client := &http.Client{Transport: vt}
+
+    // 两个独立请求
+    go client.Get("https://...")
+    go client.Get("https://...")
+
+    //
+    vt.WaitHeldCount(context.Background(), 2)
+
+    // 同时释放最后字节，发送完整请求
+    vt.Fire()
+```
+
 ## 1. 使用标准库 `net/http`
 
 ```go
@@ -38,10 +53,10 @@ import (
 
 func main() {
     // 1. 创建 Straddle Transport
-    st := volley.NewTransport()
+    vt := volley.NewTransport()
 
     client := &http.Client{
-        Transport: st,
+        Transport: vt,
         Timeout:   10 * time.Second,
     }
 
@@ -66,9 +81,16 @@ func main() {
     fmt.Println("Waiting for connections to be ready...")
     time.Sleep(2 * time.Second) // 等待所有连接建立完成
 
-    // 3. 瞬时触发！
+    // 等待20个请求预埋完毕
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := st.Wait(ctx, 20); err != nil {
+		fmt.Printf("[Client] Wait error: %v\n", err)
+	}
+
+    // 4. 瞬时触发！
     fmt.Println("🔥 FIRE!")
-    st.Fire()
+    vt.Fire()
 
     wg.Wait()
 }
@@ -85,10 +107,10 @@ import (
 )
 
 func main() {
-    st := volley.NewTransport()
+    vt := volley.NewTransport()
 
     client := resty.New()
-    client.SetTransport(st)
+    client.SetTransport(vt)
 
     // ... 发起并发请求，随后调用 st.Fire() ...
 }
@@ -122,7 +144,7 @@ Server listening on port 8765...
 [Server] 🔌 TCP Connection New    | Src: [::1]:65422 | Time: 17:46:27.110572
 [Client] Sleeping before next request...
 [Server] 🔌 TCP Connection New    | Src: [::1]:65423 | Time: 17:46:27.348289
-[Client] ⏸️  All requests buffered. Waiting 1s before FIRE...
+[Client] ⏸️  Waiting for all requests to be buffered...
 [Server] 🔌 TCP Connection New    | Src: [::1]:65424 | Time: 17:46:27.586541
 [Client] 🔥 FIRE! Releasing last bytes concurrently! 17:46:28.586176
 [Server] ✅ HTTP Request Processed | Src: [::1]:65415 | Time: 17:46:28.586533

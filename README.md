@@ -30,8 +30,8 @@ go get -u github.com/ejfkdev/go-volley
     go client.Get("https://...")
     go client.Get("https://...")
 
-    //
-    vt.WaitHeldCount(context.Background(), 2)
+    // 等待请求准备完成
+    vt.Wait(context.Background(), 2)
 
     // 同时释放最后字节，发送完整请求
     vt.Fire()

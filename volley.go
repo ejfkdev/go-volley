@@ -31,24 +31,40 @@ type Transport struct {
 	// fired indicates whether the "Fire" signal has been triggered (0: Holding, 1: Fired).
 	fired int32
 
-	// --- Signaling ---
-
-	// fireChAtom holds the current broadcast channel (chan struct{}).
-	// We use atomic.Value to allow lock-free replacement during Reset().
-	fireChAtom atomic.Value
+	// heldConns keeps currently held/straddled connections for centralized fire fan-out.
+	heldMu    sync.Mutex
+	heldConns map[*StraddleConn]struct{}
 
 	// notifyCh is used to wake up WaitHeldCount when counters change.
 	notifyCh chan struct{}
+
+	enableHTTP2           bool
+	enableHTTP2SinglePack bool
+}
+
+// TransportOptions configures protocol behavior for Transport.
+type TransportOptions struct {
+	// EnableHTTP2 enables ALPN negotiation for HTTP/2 while keeping straddling semantics.
+	EnableHTTP2 bool
+	// EnableHTTP2SinglePacket enables experimental HTTP/2 single-packet style gating.
+	// It forces a single shared HTTP/2 connection so multiple streams can be held behind
+	// one final-byte release point.
+	EnableHTTP2SinglePacket bool
 }
 
 // NewTransport creates a new Transport ready for race condition testing.
 func NewTransport() *Transport {
-	t := &Transport{
-		notifyCh: make(chan struct{}, 1),
-	}
+	return NewTransportWithOptions(TransportOptions{})
+}
 
-	// Initialize the broadcast channel
-	t.fireChAtom.Store(make(chan struct{}))
+// NewTransportWithOptions creates a transport with protocol options.
+func NewTransportWithOptions(opts TransportOptions) *Transport {
+	t := &Transport{
+		notifyCh:              make(chan struct{}, 1),
+		heldConns:             make(map[*StraddleConn]struct{}),
+		enableHTTP2:           opts.EnableHTTP2,
+		enableHTTP2SinglePack: opts.EnableHTTP2 && opts.EnableHTTP2SinglePacket,
+	}
 
 	// Helper to track dial state
 	trackDial := func(dialFunc func() (net.Conn, error)) (net.Conn, error) {
@@ -74,13 +90,23 @@ func NewTransport() *Transport {
 	}
 
 	// Initialize underlying http.Transport
+	disableKeepAlives := true
+	maxIdleConnsPerHost := -1
+	maxConnsPerHost := 0
+	if t.enableHTTP2SinglePack {
+		disableKeepAlives = false
+		maxIdleConnsPerHost = 1
+		maxConnsPerHost = 1
+	}
+
 	t.Transport = &http.Transport{
-		ForceAttemptHTTP2:   false, // Straddling works best with HTTP/1.1
-		DisableKeepAlives:   true,  // Critical: Ensure 1 Request = 1 Connection
-		MaxIdleConnsPerHost: -1,    // Disable connection pooling
+		ForceAttemptHTTP2:   opts.EnableHTTP2,
+		DisableKeepAlives:   disableKeepAlives,
+		MaxIdleConnsPerHost: maxIdleConnsPerHost,
+		MaxConnsPerHost:     maxConnsPerHost,
 
 		TLSClientConfig: &tls.Config{
-			NextProtos:         []string{"http/1.1"},
+			NextProtos:         nextProtos(opts.EnableHTTP2),
 			InsecureSkipVerify: true, // Default to insecure for security testing tools
 		},
 
@@ -136,6 +162,13 @@ func NewTransport() *Transport {
 	return t
 }
 
+func nextProtos(enableHTTP2 bool) []string {
+	if enableHTTP2 {
+		return []string{"h2", "http/1.1"}
+	}
+	return []string{"http/1.1"}
+}
+
 // wrapConn encapsulates a net.Conn with straddling logic.
 func (t *Transport) wrapConn(c net.Conn) *StraddleConn {
 	atomic.AddInt32(&t.aliveCount, 1)
@@ -143,34 +176,34 @@ func (t *Transport) wrapConn(c net.Conn) *StraddleConn {
 	// Notify WaitHeldCount that we have a new alive connection (wait condition might be met)
 	t.tryNotify()
 
-	// Load the current fire channel
-	ch := t.fireChAtom.Load().(chan struct{})
-
 	return &StraddleConn{
-		Conn:    c,
-		owner:   t,
-		fireCh:  ch,
-		closeCh: make(chan struct{}),
+		Conn:  c,
+		owner: t,
 	}
 }
 
 // Fire releases the last byte for all currently buffered connections.
 // It also sets the transport to "Fired" mode, where subsequent requests pass through immediately.
 func (t *Transport) Fire() {
-	// CAS ensures we only close the channel once
+	// CAS ensures we only fire once.
 	if !atomic.CompareAndSwapInt32(&t.fired, 0, 1) {
 		return
 	}
 
-	// Broadcast signal
-	ch := t.fireChAtom.Load().(chan struct{})
-	close(ch)
+	// Centralized fan-out in one goroutine to reduce scheduler jitter.
+	conns := t.snapshotHeldConns()
+	for _, sc := range conns {
+		sc.release()
+	}
 }
 
 // Reset clears the transport state, allowing it to be reused for a new batch of requests.
 // NOTE: This must be called serially (not concurrently with Fire or WaitHeldCount).
 func (t *Transport) Reset() {
-	t.fireChAtom.Store(make(chan struct{}))
+	t.heldMu.Lock()
+	t.heldConns = make(map[*StraddleConn]struct{})
+	t.heldMu.Unlock()
+
 	atomic.StoreInt32(&t.heldCount, 0)
 	atomic.StoreInt32(&t.aliveCount, 0)
 	atomic.StoreInt32(&t.dialStartCount, 0)
@@ -195,8 +228,13 @@ func (t *Transport) Wait(ctx context.Context, want int) error {
 		held := atomic.LoadInt32(&t.heldCount)
 		alive := atomic.LoadInt32(&t.aliveCount)
 
-		// Condition 1: Wait until all expected goroutines have started dialing
-		if start < int32(want) {
+		// Condition 1: Wait until all expected goroutines have started dialing.
+		// In HTTP/2 single-packet mode, many requests may share one dial.
+		if !t.enableHTTP2SinglePack {
+			if start < int32(want) {
+				return false
+			}
+		} else if start == 0 {
 			return false
 		}
 
@@ -246,17 +284,39 @@ func (t *Transport) tryNotify() {
 	}
 }
 
+func (t *Transport) registerHeldConn(sc *StraddleConn) {
+	t.heldMu.Lock()
+	t.heldConns[sc] = struct{}{}
+	t.heldMu.Unlock()
+}
+
+func (t *Transport) unregisterHeldConn(sc *StraddleConn) {
+	t.heldMu.Lock()
+	delete(t.heldConns, sc)
+	t.heldMu.Unlock()
+}
+
+func (t *Transport) snapshotHeldConns() []*StraddleConn {
+	t.heldMu.Lock()
+	conns := make([]*StraddleConn, 0, len(t.heldConns))
+	for sc := range t.heldConns {
+		conns = append(conns, sc)
+	}
+	t.heldConns = make(map[*StraddleConn]struct{})
+	t.heldMu.Unlock()
+	return conns
+}
+
 // --- Straddle Conn ---
 
 type StraddleConn struct {
 	net.Conn
-	owner   *Transport
-	fireCh  chan struct{}
-	closeCh chan struct{}
+	owner *Transport
 
 	held      byte
 	hasHeld   bool
 	isCounted bool
+	byteBuf   [1]byte
 
 	// mu protects internal state of this specific connection only.
 	// No global lock contention.
@@ -279,43 +339,33 @@ func (sc *StraddleConn) Write(b []byte) (int, error) {
 	// Double Check
 	if atomic.LoadInt32(&sc.owner.fired) == 1 {
 		if sc.hasHeld {
-			sc.Conn.Write([]byte{sc.held})
+			_, _ = sc.writeHeldByteLocked()
 			sc.hasHeld = false
 		}
 		return sc.Conn.Write(b)
 	}
 
-	// Buffer logic
-	var payload []byte
 	if sc.hasHeld {
-		payload = append(payload, sc.held)
-		sc.hasHeld = false
-	}
-	payload = append(payload, b...)
-
-	if len(payload) == 0 {
-		return len(b), nil
+		if _, err := sc.writeHeldByteLocked(); err != nil {
+			return 0, err
+		}
 	}
 
 	// Keep the last byte
-	toHold := payload[len(payload)-1]
-	sc.held = toHold
+	sc.held = b[len(b)-1]
 	sc.hasHeld = true
 
-	// If this is the first time we hold data, increment counters and start listener
+	// If this is the first time we hold data, increment counters and register conn
 	if !sc.isCounted {
 		atomic.AddInt32(&sc.owner.heldCount, 1)
+		sc.owner.registerHeldConn(sc)
 		sc.isCounted = true
 		sc.owner.tryNotify()
-
-		// Spawn a lightweight listener for the Fire signal
-		go sc.waitForFire()
 	}
 
 	// Send N-1 bytes
-	toSend := payload[:len(payload)-1]
-	if len(toSend) > 0 {
-		_, err := sc.Conn.Write(toSend)
+	if toSendLen := len(b) - 1; toSendLen > 0 {
+		_, err := sc.Conn.Write(b[:toSendLen])
 		if err != nil {
 			return 0, err
 		}
@@ -324,24 +374,18 @@ func (sc *StraddleConn) Write(b []byte) (int, error) {
 	return len(b), nil
 }
 
-func (sc *StraddleConn) waitForFire() {
-	select {
-	case <-sc.fireCh:
-		// Broadcast received
-		sc.release()
-	case <-sc.closeCh:
-		// Connection closed prematurely
-		return
-	}
-}
-
 func (sc *StraddleConn) release() {
 	sc.mu.Lock()
 	defer sc.mu.Unlock()
 	if sc.hasHeld {
-		_, _ = sc.Conn.Write([]byte{sc.held})
+		_, _ = sc.writeHeldByteLocked()
 		sc.hasHeld = false
 	}
+}
+
+func (sc *StraddleConn) writeHeldByteLocked() (int, error) {
+	sc.byteBuf[0] = sc.held
+	return sc.Conn.Write(sc.byteBuf[:])
 }
 
 func (sc *StraddleConn) Close() error {
@@ -350,6 +394,8 @@ func (sc *StraddleConn) Close() error {
 	// If the connection was counted as "Held", we need to reverse that
 	// if it closes before firing.
 	if sc.isCounted {
+		sc.owner.unregisterHeldConn(sc)
+
 		// Only decrement if we haven't fired yet.
 		// If we fired, the counter is conceptually "consumed".
 		if atomic.LoadInt32(&sc.owner.fired) == 0 {
@@ -357,20 +403,13 @@ func (sc *StraddleConn) Close() error {
 		}
 		sc.isCounted = false
 
-		// Signal the background goroutine to stop waiting
-		select {
-		case <-sc.closeCh:
-		default:
-			close(sc.closeCh)
-		}
-
 		// Notify transport state change
 		sc.owner.tryNotify()
 	}
 
 	// Flush before closing (best effort)
 	if sc.hasHeld {
-		sc.Conn.Write([]byte{sc.held})
+		sc.writeHeldByteLocked()
 		sc.hasHeld = false
 	}
 	sc.mu.Unlock()

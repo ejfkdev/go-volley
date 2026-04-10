@@ -116,6 +116,79 @@ func main() {
 }
 ```
 
+
+## 3. HTTP/2 支持（Turbo Intruder 风格）
+
+```go
+opts := volley.TransportOptions{EnableHTTP2: true}
+vt := volley.NewTransportWithOptions(opts)
+client := &http.Client{Transport: vt}
+
+// 预埋请求后等待并触发
+_ = vt.Wait(context.Background(), 10)
+vt.Fire()
+```
+
+### HTTP/2 单包攻击（实验性）
+
+```go
+opts := volley.TransportOptions{
+    EnableHTTP2:             true,
+    EnableHTTP2SinglePacket: true,
+}
+
+vt := volley.NewTransportWithOptions(opts)
+client := &http.Client{Transport: vt}
+
+// 并发请求尽量复用同一条 h2 连接，最后通过 Fire() 统一释放
+```
+
+> 说明：该模式会强制单连接复用（MaxConnsPerHost=1），更接近 Turbo Intruder 的 HTTP/2 gate 行为。
+
+## 4. Gate 批次引擎（受 Turbo Intruder 启发）
+
+```go
+eng := volley.NewEngine()
+// 每个 Engine 实例就是一个独立队列组
+eng.Transport = volley.NewTransportWithOptions(volley.TransportOptions{EnableHTTP2: true})
+eng.Client = &http.Client{Transport: eng.Transport}
+
+for i := 0; i < 20; i++ {
+    req, _ := http.NewRequest("POST", "https://target", nil)
+    eng.Queue(req, func(resp *http.Response, err error) {
+        // handle result
+    })
+}
+
+// 等待该 gate 的请求全部进入 hold，再集中触发
+_ = eng.OpenWithTimeout(10*time.Second)
+```
+
+
+## 5. 底层 HTTP/2 Single-Packet Engine（更接近 Turbo Intruder）
+
+```go
+ctx := context.Background()
+eng := volley.NewH2SinglePacketEngine("target:443", &tls.Config{
+    ServerName:         "target",
+    InsecureSkipVerify: true,
+    NextProtos:         []string{"h2"},
+})
+_ = eng.Connect(ctx)
+
+for i := 0; i < 20; i++ {
+    req, _ := http.NewRequest("POST", "https://target/race", nil)
+    _ = eng.QueueRequest(req, []byte("a=1"))
+}
+
+// 一次性释放所有流最后1字节
+_ = eng.Fire()
+_ = eng.Close()
+```
+
+> 注意：这是实验性低层能力，目标是逼近 Turbo Intruder 的 h2 gate/single-packet 效果；
+> 但由于 Go 运行时和标准网络栈抽象，仍不保证与 Turbo Intruder 在所有目标上的完全一致表现。
+
 ## 示例运行输出
 
 <details>
